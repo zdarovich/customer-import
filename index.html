@@ -42,9 +42,10 @@
             <li>
               <label for="fileinput">
                 CSV file:
-                <input v-if="!loading" class="input is-danger" type="file" id="fileinput" ref="file" v-on:change="handleFileUpload()"/>
-                <div v-else class="loader is-loading has-text-centered"></div>
               </label>
+
+              <input v-if="!loading" class="input is-danger" type="file" id="fileinput" ref="file" v-on:change="handleFileUpload()"/>
+              <div v-else class="loader is-loading has-text-centered"></div>
             </li>
             <li>
               <div class="columns">
@@ -71,13 +72,27 @@
 
       </div>
       <div class="container has-text-centered">
+        <progress class="progress is-danger" :value="min" :max="max"></progress>
         <button v-if="!uploading" v-on:click="upload()" class="button is-danger is-outlined" href="#" id="download">Upload</button>
         <div v-else class="loader is-loading has-text-centered"></div>
-
+        <div><p>new customers added total: {{successTotal}}</p></div>
+        <div v-if="uploadSuccesses.length !== 0" v-for="(us, index) in uploadSuccesses" :key="index">
+          <ul>
+            <li>
+              <div class="notification is-success is-light">
+                {{us}}
+              </div>
+            </li>
+          </ul>
+        </div>
         <div v-if="uploadErrors.length !== 0" v-for="(err, index) in uploadErrors" :key="index">
-          <p>
-            {{err}}
-          </p>
+          <ul>
+            <li>
+              <div class="notification is-danger is-light">
+              {{err}}
+              </div>
+            </li>
+          </ul>
         </div>
       </div>
     </section>
@@ -94,14 +109,17 @@
   let v = new Vue({
     el: "#app",
     data: {
+      min: 0,
+      max: 0,
+      successTotal: 0,
       customers: [],
       uploading: false,
+      uploadSuccesses: [],
       uploadErrors: [],
       isError: false,
       fileError: null,
       results: null,
       loading: false,
-      loaded: false,
       sessionKey: "",
       customerNumber: "",
       rowNames: {},
@@ -133,13 +151,11 @@
           complete: function(results) {
             console.log(results);
             self.loading = false
-            self.loaded = true
             self.processFile(results)
           },
           error: function(err, file, inputElem, reason) {
             console.log(err);
             self.loading = false
-            self.loaded = false
             self.isError = true
             self.fileError = err
           },
@@ -159,7 +175,10 @@
         if (!this.payload && !this.rowNames) {
           return
         }
-
+        this.uploadErrors = []
+        this.uploadSuccesses = []
+        this.max = this.payload.length
+        this.min = 0
         this.uploading = true
         let self = this
         let customers = []
@@ -176,36 +195,114 @@
           }
           customers.push(customer)
         }
-        this.customers = customers
-        console.log(customers)
+        this.rateLimitMap(customers, 9, 20, this.createCustomer).then(function(results) {
+          // process array of results here
+          results.forEach(function(result) {
+            self.processResponse(result)
+          })
+          self.uploading = false
 
-        for (let c in customers) {
-          this.createCustomer(c)
-                  .then(response => console.log([{ customerID: response.data.result.id }]))
-                  .catch(err => {
-                    console.log(err)
-                    self.uploadErrors.push(err)
-                  });
-        }
-        this.uploading = false
+        }, function(err) {
+          self.uploadErrors.push(err)
+          self.uploading = false
+        });
+
         },
-      createCustomer: function (params) {
+      processResponse: function (response) {
+        if (response.status !== 200) {
+            this.uploadErrors.push("server HTTP response" + response.status)
+        }
+        if (response && response.data) {
+          if (response.data.status.responseStatus !== 'error') {
+            if (response.data.records.length === 0) {
+              this.uploadErrors.push("customer was not added")
+              return
+            }
+            let customerId = response.data.records[0].customerID
+              if (response.data.records[0].alreadyExists) {
+                this.uploadSuccesses.push("customer with ID " + customerId + " already exists")
+              } else {
+                this.uploadSuccesses.push("customer with ID " + customerId + " was added")
+                this.successTotal++
+              }
+          } else {
+            this.uploadErrors.push(response.data.status)
+          }
+        }
+      },
+      createCustomer: async function (params) {
         let formData = new FormData();
         formData.append('request', 'saveCustomer')
         formData.append('clientCode', this.customerNumber)
         formData.append('sessionKey', this.sessionKey)
         for ( let key in params ) {
           formData.append(key, params[key]);
-
         }
-        let url = 'https://' + this.customerNumber + '.erply.com/api/';
+        // const proxyurl = "";
+        const proxyurl = "https://cors-anywhere.herokuapp.com/";
+        let url = proxyurl + 'https://' + this.customerNumber + '.erply.com/api/';
         return axios({
           method: 'post',
           url: url,
           data: formData,
           headers: this.headers
         })
-      }
+      },
+      rateLimitMap: function (array, requestsPerSec, maxInFlight, fn) {
+        let self = this;
+      return new Promise(function(resolve, reject) {
+        var index = 0;
+        var inFlightCntr = 0;
+        var doneCntr = 0;
+        var launchTimes = [];
+        var results = new Array(array.length);
+
+        // calculate num requests in last second
+        function calcRequestsInLastSecond() {
+          var now = Date.now();
+          // look backwards in launchTimes to see how many were launched within the last second
+          var cnt = 0;
+          for (var i = launchTimes.length - 1; i >= 0; i--) {
+            if (now - launchTimes[i] < 1000) {
+              ++cnt;
+            } else {
+              break;
+            }
+          }
+          return cnt;
+        }
+
+        function runMore() {
+          while (index < array.length && inFlightCntr < maxInFlight && calcRequestsInLastSecond() < requestsPerSec) {
+            (function(i) {
+              ++inFlightCntr;
+              launchTimes.push(Date.now());
+              fn(array[i]).then(function(val) {
+                results[i] = val;
+                --inFlightCntr;
+                ++doneCntr;
+                self.min++
+                runMore();
+              }, reject);
+            })(index);
+            ++index;
+          }
+          // see if we're done
+          if (doneCntr === array.length) {
+            resolve(results);
+          } else if (launchTimes.length >= requestsPerSec) {
+            // calc how long we have to wait before sending more
+            var delta = 1000 - (Date.now() - launchTimes[launchTimes.length - requestsPerSec]);
+            if (delta >= 0) {
+              setTimeout(runMore, ++delta);
+            }
+
+          }
+        }
+        runMore();
+      });
+  }
+
     },
   });
 
